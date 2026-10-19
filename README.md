@@ -11,7 +11,7 @@ Vulhub environment.
 | --- | --- |
 | Repository | <https://github.com/dsg857/IS_lab1> |
 | Pipeline run used as evidence | <https://github.com/dsg857/IS_lab1/actions/runs/39240182883> |
-| All runs, newest first | <https://github.com/dsg857/IS_lab1/actions/workflows/ci.yml> |
+| All successful runs | <https://github.com/dsg857/IS_lab1/actions/workflows/ci.yml?query=is%3Asuccess> |
 | Vulnerability | CVE-2021-35042 (Django `QuerySet.order_by()` SQL injection) |
 
 ## Repository layout
