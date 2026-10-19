@@ -1,176 +1,320 @@
-# Work 1: Secure REST API and CVE Analysis
+# Work 1 — Secure REST API Development with CI/CD and Real CVE Vulnerability Analysis
 
-A small notes API built with Flask, SQLite, PyJWT and bcrypt. The API, basic
-security measures and CI/security workflow are implemented. The first cloud CI
-run, the Vulhub experiment and the final report are still pending; this README
-will be extended with actual evidence.
+A small notes API written with Flask and SQLite, protected with parameterised
+SQL, output escaping, bcrypt password hashing and short-lived JWTs. The
+repository also contains the GitHub Actions pipeline that tests the API and runs
+SAST and SCA on every push, and an analysis of a real vulnerability
+(**CVE-2021-35042**) that was reproduced, explained, fixed and re-tested in a
+Vulhub environment.
 
-## Run locally
+| | |
+| --- | --- |
+| Repository | <https://github.com/dsg857/IS_lab1> |
+| Pipeline run used as evidence | <https://github.com/dsg857/IS_lab1/actions/runs/39240182883> |
+| All runs, newest first | <https://github.com/dsg857/IS_lab1/actions/workflows/ci.yml> |
+| Vulnerability | CVE-2021-35042 (Django `QuerySet.order_by()` SQL injection) |
 
-Use Python 3.10 or newer. From the project directory:
+## Repository layout
 
-```bash
-# The work1 virtual environment already exists on this machine.
-source work1/bin/activate
-python -m pip install -r requirements-dev.txt
-export JWT_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
-python -m flask --app app init-db --login alice
-python -m flask --app app run --host 127.0.0.1 --port 5001
+```
+.
+├── app.py                     # the Flask API
+├── tests/test_api.py          # 30 API and security tests
+├── requirements.txt           # runtime dependencies
+├── requirements-dev.txt       # runtime + test/scanning dependencies
+├── .github/workflows/ci.yml   # API tests, Bandit (SAST), Snyk (SCA)
+├── docs/
+│   ├── api/                   # curl evidence for the API
+│   ├── ci/                    # CI screenshot and downloaded scan reports
+│   └── cve/                   # reproduction and fix evidence
+├── cve/
+│   ├── README.md              # CVE analysis in detail
+│   └── fix/                   # changed source and configuration files
+└── README.md
 ```
 
-Choose a password when prompted (8–72 UTF-8 bytes); it is not echoed. The database
-is saved in `instance/app.sqlite3`. Run `init-db` with a different login to add
-another user; existing users and notes are kept. If the login already exists,
-the command fails without changing its password.
+`work1/` (the local virtual environment), `vulhub/` (the upstream lab checkout),
+`instance/` (the local database) and `reports/` are excluded from Git.
 
-Keep the server terminal open. Export the secret again before starting the app
-in a new terminal. Generating a new secret invalidates previously issued tokens.
-The server binds to localhost with debug mode off for this local lab.
+## 1. The API
 
-## Endpoints and curl examples
+### Endpoints
 
 | Method | Path | Authentication | Purpose |
 | --- | --- | --- | --- |
-| POST | `/auth/login` | None | Accept `login` and `password`; return a JWT |
-| GET | `/api/data` | Bearer JWT | List the current user's notes |
-| POST | `/api/data` | Bearer JWT | Create a note using a JSON `content` field |
+| `POST` | `/auth/login` | none | Accept `login` and `password`, return a JWT |
+| `GET` | `/api/data` | Bearer JWT | List the current user's notes |
+| `POST` | `/api/data` | Bearer JWT | Create a note from a JSON `content` field |
 
-In another terminal, replace `YOUR_PASSWORD` with the password you chose:
+`POST /api/data` is the third method chosen for the assignment: it makes the
+protected resource writable, so the data endpoint can be exercised end to end
+rather than only read.
+
+### Running locally
+
+Python 3.10 or newer is required:
 
 ```bash
-curl -i http://127.0.0.1:5001/api/data
-# Expected: 401 (no token).
+source work1/bin/activate                 # existing local virtual environment
+python -m pip install -r requirements-dev.txt
+export JWT_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+python -m flask --app app init-db --login alice   # prompts for a password
+python -m flask --app app run --host 127.0.0.1 --port 5001
+```
 
+Passwords must be 8–72 UTF-8 bytes; the database is written to
+`instance/app.sqlite3`. A new `JWT_SECRET_KEY` invalidates previously issued
+tokens, and the application refuses to start without a secret of at least 32
+bytes.
+
+### Example session
+
+```bash
+# 1. No token: rejected
+curl -i http://127.0.0.1:5001/api/data
+# HTTP/1.1 401 {"error":"A Bearer token is required."}
+
+# 2. Log in
 curl -sS http://127.0.0.1:5001/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"login":"alice","password":"YOUR_PASSWORD"}'
-# Expected: access_token and expires_in=1800.
-```
+# {"access_token":"…","expires_in":1800}
 
-Copy the `access_token` value into `TOKEN` in that terminal:
-
-```bash
 TOKEN='PASTE_ACCESS_TOKEN_HERE'
 
+# 3. Create a note
 curl -i http://127.0.0.1:5001/api/data \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"content":"My first secure note"}'
-# Expected: 201, with the new note's id and content.
+# HTTP/1.1 201
 
-curl -i http://127.0.0.1:5001/api/data \
-  -H "Authorization: Bearer $TOKEN"
-# Expected: 200, with {"data":[...]} containing only this user's notes.
+# 4. Read only this user's notes
+curl -i http://127.0.0.1:5001/api/data -H "Authorization: Bearer $TOKEN"
+# HTTP/1.1 200 {"data":[…]}
 ```
 
-Invalid credentials/tokens return 401, invalid JSON/fields return 400, and bodies
-over 16 KiB return 413. Notes must be non-blank and at most 1000 characters.
+Screenshots of the same checks are in `docs/api/`:
 
-## Security measures
+| Evidence | Result |
+| --- | --- |
+| [`01-no-token-401.png`](docs/api/01-no-token-401.png) | access without a token denied |
+| [`02-login-200.png`](docs/api/02-login-200.png) | login returns a JWT |
+| [`03-xss-escaped-201.png`](docs/api/03-xss-escaped-201.png) | `<script>` stored and returned escaped |
 
-- **SQL injection:** every query containing user input uses SQLite `?` placeholders
-  with a separate parameter tuple. No input is concatenated into SQL.
-- **XSS:** note content is stored as text and escaped on output with MarkupSafe's
-  `escape()`. Both note endpoints return JSON via `jsonify()`, with
-  `Content-Type: application/json` and `X-Content-Type-Options: nosniff`.
-  A future frontend should render text with `textContent`, rather than `innerHTML`.
-- **Authentication:** passwords are stored only as salted bcrypt hashes (default
-  cost 12). Login issues a 30-minute JWT. A shared decorator protects both note
-  endpoints, fixes the allowed algorithm to HS256, requires `sub`/`iat`/`exp`,
-  checks the signature and expiry, and checks that the user still exists.
-- **Configuration and access:** the JWT signing secret comes from an environment
-  variable (at least 32 bytes), with no default secret. Database queries restrict
-  notes to the authenticated user's ID. Secrets, the local database, the virtual
-  environment and the upstream Vulhub checkout are excluded from Git.
+The token visible in the login screenshot expired 30 minutes after it was
+issued, and the signing key lives only in the environment, not in the
+repository.
 
-References: [OWASP SQL injection prevention](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html),
-[Flask security](https://flask.palletsprojects.com/en/stable/web-security/),
-[PyJWT usage](https://pyjwt.readthedocs.io/en/stable/usage.html).
+Invalid credentials and invalid tokens return `401`; malformed JSON or fields
+return `400`; bodies over 16 KiB return `413`; notes must be non-blank and at
+most 1000 characters.
 
-## Local checks
+## 2. Security measures
+
+### SQL injection
+
+Every query that contains user input uses SQLite `?` placeholders with the input
+passed as a separate parameter tuple — for example:
+
+```python
+user = get_db().execute(
+    "SELECT login, password_hash FROM users WHERE login = ?", (username,)
+).fetchone()
+```
+
+No input is concatenated or interpolated into SQL, and the note queries are also
+restricted to the authenticated user's `id`.
+
+### XSS
+
+Note content is stored as text and escaped on output with MarkupSafe's
+`escape()`, so `<script>…</script>` is returned as `&lt;script&gt;…`. Both note
+endpoints answer with `jsonify()`, i.e. `Content-Type: application/json`, and
+every response carries `X-Content-Type-Options: nosniff`. A future frontend
+should render values with `textContent`, never `innerHTML`.
+
+### Authentication and password storage
+
+- Passwords are stored only as salted bcrypt hashes (cost 12), never in plain
+  text.
+- Login issues a 30-minute HS256 JWT containing `sub`, `iat` and `exp`.
+- A shared `login_required` decorator protects the data endpoints: it fixes the
+  accepted algorithm, requires the three claims, verifies the signature and
+  expiry, and checks that the user still exists.
+- The signing secret comes from the `JWT_SECRET_KEY` environment variable, must
+  be at least 32 bytes and has no default.
+
+### Configuration and access control
+
+Notes are always filtered by the authenticated user's ID, the database and
+secrets are excluded from Git, and the API never runs with debug mode enabled in
+the provided run command.
+
+## 3. CI/CD with SAST and SCA
+
+`.github/workflows/ci.yml` runs automatically on every push and pull request and
+can also be started manually from **Actions → API tests and security scans →
+Run workflow**. Three independent jobs run on Ubuntu with Python 3.10:
+
+| Job | What it checks | Artifact |
+| --- | --- | --- |
+| **API tests** | authentication, data access and the security behaviour | `api-test-report` (`pytest.xml`) |
+| **SAST — Bandit** | the application source (`app.py`) | `bandit-sast-report` (`bandit.json`) |
+| **SCA — Snyk** | known vulnerabilities in runtime, development and transitive dependencies | `snyk-sca-report` (`snyk.json`) |
+
+A failing test, a Bandit finding, a Snyk vulnerability or a scanner error makes
+the corresponding job fail; the other jobs still run, and reports are uploaded
+with `always()` so evidence is kept even for a failing run. Actions are pinned
+to commit hashes and the Snyk CLI to `1.1308.1`.
+
+The successful run used as evidence is
+[run #2](https://github.com/dsg857/IS_lab1/actions/runs/39240182883) on commit
+`ea077f3`:
+
+![Successful pipeline run](docs/ci/actions-run-2-success.png)
+
+All three jobs are green and all three artifacts are present. The downloaded
+reports are committed under `docs/ci/`:
+
+- `pytest.xml` — 30 tests, 0 failures, 0 errors
+- `bandit.json` — 0 findings (no checks suppressed)
+- `snyk.json` — `"ok": true`, 23 dependencies, 0 vulnerabilities
+
+The SCA job needs a `SNYK_TOKEN` repository secret (**Settings → Secrets and
+variables → Actions**). Without it the job fails with an explicit setup message
+instead of pretending to pass.
+
+## 4. CVE analysis: CVE-2021-35042
+
+The full analysis, with every command and screenshot, is in
+[`cve/README.md`](cve/README.md). The summary follows.
+
+### 4.1 Vulnerability
+
+Django 3.2.x before 3.2.5 and 3.1.x before 3.1.13 allow SQL injection through
+`QuerySet.order_by()` when untrusted input is passed as the ordering argument.
+CVSS 3.1 score **9.8 (Critical)**; the flaw is unauthenticated and needs only one
+request. It is a realistic bug for this assignment because the API also deals
+with authentication and SQL, and because it shows the one place where
+parameterised queries cannot help.
+
+### 4.2 Environment
+
+The Vulhub lab `django/CVE-2021-35042` (Django 3.2.4, MySQL 5.7.44) was started
+with `docker compose up -d`; the images are `linux/amd64` only, so
+`platform: linux/amd64` was added to both services and the containers ran through
+Rosetta emulation on the Apple Silicon host.
+
+![Environment ready](docs/cve/01-environment.png)
+
+The sort parameter works normally before the attack (`?order=-id` returns the
+rows in descending order), which is later reused as the regression test:
+
+![Normal ordering](docs/cve/02-normal-order.png)
+
+### 4.3 Reproduction
+
+The view passes the raw parameter to the ORM, so the following unauthenticated
+request is enough:
 
 ```bash
-python -m pytest -q
-mkdir -p reports
-python -m bandit app.py -f json -o reports/bandit.json
+curl -s -G 'http://127.0.0.1:8000/vuln/' \
+  --data-urlencode "order=vuln_collection.name);select updatexml(1, concat(0x7e,(select @@version)),1)#"
 ```
 
-Tests use temporary databases, so they do not change your local notes. They cover
-login, password hashing, both protected endpoints, invalid/expired/forged tokens,
-SQL injection inputs, XSS escaping, user isolation and invalid input.
-Bandit is SAST; it does not replace a dependency vulnerability scanner (SCA).
+The response is `HTTP 500` with `(1105, "XPATH syntax error: '~5.7.44'")`: the
+closing parenthesis ends the `ORDER BY` expression, `#` comments out the rest of
+the statement, and `updatexml()` reflects the subquery result in its error
+message, disclosing the database version without any credentials.
 
-Local verification on 2026-10-19: **30 tests passed**, **0 Bandit findings**
-(no checks suppressed), and **6 real curl checks passed**, including login,
-authenticated create/read, missing/invalid tokens and escaped script content.
-Local reports are `reports/pytest.xml`, `reports/bandit.json` and
-`reports/http-check.txt`. These are local results; CI screenshots are still pending.
+![SQL injection](docs/cve/03-sql-injection.png)
 
-## CI/CD and security scanning (assignment step 4)
+### 4.4 Root cause
 
-The workflow is `.github/workflows/ci.yml`. Every push and pull request starts
-three independent jobs on Ubuntu with Python 3.10; it can also be started manually
-using **Actions → API tests and security scans → Run workflow**.
+`ORDER BY` cannot be parameterised — placeholders bind values, while the ordering
+target is an identifier or expression resolved by the database at parse time.
+Django 3.2.4 had a deprecation shortcut in `Query.add_ordering()`: a string
+containing a dot was assumed to be a raw column alias, so validation was skipped
+and `SQLCompiler.get_order_by()` passed the remainder verbatim into `RawSQL()`,
+quoting only the table prefix. The view then supplied user input as that string,
+so attacker-controlled SQL syntax reached the generated statement. Django 3.2.5
+restored strict validation: only strings matching `[-+]?[.\w]+$` may take the
+raw-alias path; everything else is resolved as a field name and raises
+`FieldError` before SQL is built.
 
-| Job | What it checks | Downloadable artifact |
-| --- | --- | --- |
-| API tests | Authentication, data access and security behavior | `api-test-report` (`pytest.xml`) |
-| SAST - Bandit | Application source in `app.py` | `bandit-sast-report` (`bandit.json`) |
-| SCA - Snyk | Known vulnerabilities in runtime/development dependencies, including transitive dependencies | `snyk-sca-report` (`snyk.json`) |
+### 4.5 Fix
 
-Snyk scans `requirements-dev.txt`, which also includes `requirements.txt`.
-A failing test, a Bandit finding, a Snyk vulnerability or a scanner error makes
-the corresponding job fail. Other jobs still run. The workflow does not ignore
-scan exit codes or weaken the severity threshold. Report upload uses `always()`
-so existing reports are saved even when checks fail; artifacts are kept for 30 days.
-Actions are pinned to verified commits, and Snyk CLI is pinned to version 1.1308.1.
+`vuln/views.py` no longer forwards the raw parameter. It parses an optional
+leading `-`, validates the remaining field name against `{'id', 'name'}`, returns
+`400` otherwise, and rebuilds the ordering string from the validated value. The
+attacker can only choose one of two columns and the direction; no part of the
+SQL expression is under their control. The changed files are in
+[`cve/fix/`](cve/fix/) with a unified diff in
+[`cve/fix/patch.diff`](cve/fix/patch.diff).
 
-### Enable it after uploading the repository
+### 4.6 Verification
 
-1. Push this project, including `.github/workflows/ci.yml`, to your GitHub repository.
-2. Get the API token from your [Snyk account settings](https://app.snyk.io/account).
-3. In the GitHub repository, open **Settings → Secrets and variables → Actions →
-   New repository secret**. Set the name to `SNYK_TOKEN` and paste the token as its value.
-4. Open **Actions** and run the workflow manually, or make another push/PR.
-5. Open the run, check all three jobs and download the artifacts. Save screenshots
-   of the successful SAST/SCA steps and their reports, plus the successful run URL,
-   for the assignment.
+The same request against the fixed version returns `400 Invalid order
+parameter.`; normal ordering, the default page and `?order=name` still work. Five
+alternative payloads (`name);select 1#`, `(select 1)`, `name--`, `id DESC`,
+`Name`) are all rejected with `400`, which confirms the check is an allowlist
+rather than a keyword filter.
 
-Do not put the token in source files or commit it. Without `SNYK_TOKEN`, the SCA
-job fails with a setup message. GitHub does not provide repository secrets to
-pull requests from external forks, so those SCA runs need to be repeated on a
-trusted branch in this repository; tests and Bandit still run.
+![Exploit blocked](docs/cve/04-exploit-blocked.png)
 
-The assignment's CI/CD requirement is implemented as automated testing and
-security scanning. It does not require deploying the API to a public server.
-The workflow is configured locally; there is no cloud success claim or Snyk scan
-result yet because the repository has not been uploaded and no token is configured.
+![Rejected with 400](docs/cve/05-curl-400.png)
 
-Local verification on 2026-10-19: actionlint 1.7.12 passed the workflow;
-the trigger/job/report configuration, Bash syntax, pinned Action inputs and
-missing-token failure behavior also passed validation;
-the workflow's API test command passed all 30 tests and Bandit reported 0 findings.
-Snyk authentication and its live vulnerability results still require a real token.
+![Regression and bypass tests](docs/cve/06-regression-and-bypass.png)
 
-References: [Snyk GitHub Actions](https://docs.snyk.io/developer-tools/snyk-ci-cd-integrations/github-actions-for-snyk-setup-and-checking-for-vulnerabilities),
-[Snyk test command and JSON reports](https://docs.snyk.io/developer-tools/snyk-cli/commands/test),
-[GitHub workflow artifacts](https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow).
+## 5. Local verification
 
-## Assignment progress
-
-| Requirement from the assignment | Status |
+| Check | Result |
 | --- | --- |
-| Choose stack and initialize local Git | Implemented locally |
-| Login + protected data + a third method | Implemented |
-| Parameterized SQL, XSS escaping, JWT and password hashing | Implemented |
-| API tests and curl instructions | Implemented locally |
-| Public remote repository | Pending upload |
-| CI on push/PR with SAST and SCA, report artifacts | Configured locally; cloud run and Snyk token pending |
-| Screenshots of successful SAST/SCA runs and successful CI link | Pending cloud verification |
-| Select and launch a Vulhub CVE | Pending |
-| Reproduce, explain root cause, apply and verify fix | Pending |
-| CVE evidence, fix folder, successful CI link, final report | Pending |
+| `python -m pytest -q` | 30 tests passed (login, hashing, both protected endpoints, invalid/expired/forged tokens, SQL-injection inputs, XSS escaping, user isolation, invalid input) |
+| `python -m bandit app.py -f json` | 0 findings, no checks suppressed |
+| Real `curl` checks | 6 checks passed: login, authenticated create/read, missing/invalid tokens, escaped script content |
 
-The final report must include the required title page (work number/title,
-variant, surname/name and HDU number). Real CI/CVE results and screenshots will
-be added after those steps run successfully.
+## 6. Evidence index
+
+| Assignment requirement | Evidence |
+| --- | --- |
+| API description and call examples | §1 of this README, `docs/api/` |
+| Security measures | §2, `tests/test_api.py` |
+| SAST/SCA screenshots | [`docs/ci/actions-run-2-success.png`](docs/ci/actions-run-2-success.png) |
+| CVE ID and description | §4.1, [`cve/README.md`](cve/README.md) |
+| Reproduction commands and screenshots | §4.3, `docs/cve/01`–`03` |
+| Root cause | §4.4, `cve/README.md` |
+| Applied fix | §4.5, [`cve/fix/`](cve/fix/) |
+| Proof of elimination | §4.6, `docs/cve/04`–`06` |
+| Successful pipeline run | <https://github.com/dsg857/IS_lab1/actions/runs/39240182883> |
+
+## 7. Assignment checklist
+
+| Requirement | Status |
+| --- | --- |
+| Chosen stack, project and local Git repository | Done |
+| Login, protected data and a third method | Done |
+| Parameterised SQL, XSS escaping, JWT and password hashing | Done |
+| API tests and curl instructions | Done |
+| Public remote repository | Done — <https://github.com/dsg857/IS_lab1> |
+| CI on push/PR with SAST and SCA and report artifacts | Done — 3 jobs, run #2 green |
+| Screenshots of the successful SAST/SCA run | Done — `docs/ci/` |
+| Select and launch a Vulhub CVE | Done — CVE-2021-35042 |
+| Reproduce, explain the root cause, apply and verify the fix | Done — `cve/` |
+| Final report | Prepared separately from this README |
+
+## References
+
+- OWASP Top 10 — <https://owasp.org/www-project-top-ten/>
+- OWASP SQL injection prevention —
+  <https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html>
+- OWASP XSS prevention —
+  <https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html>
+- Flask security — <https://flask.palletsprojects.com/en/stable/web-security/>
+- PyJWT usage — <https://pyjwt.readthedocs.io/en/stable/usage.html>
+- GitHub Actions — <https://docs.github.com/en/actions>
+- Vulhub — <https://github.com/vulhub/vulhub>
+- NVD, CVE-2021-35042 — <https://nvd.nist.gov/vuln/detail/CVE-2021-35042>
+- Django security release, 1 July 2021 —
+  <https://www.djangoproject.com/weblog/2021/jul/01/security-releases/>

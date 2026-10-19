@@ -1,0 +1,42 @@
+--- a/vuln/views.py
++++ b/vuln/views.py
+@@ -1,10 +1,17 @@
+ from django.shortcuts import HttpResponse
+ from .models import Collection
+ 
+-# Create your views here.
++# CVE-2021-35042: ORDER BY takes an expression, not a bind parameter, so user
++# input must never be passed to order_by() directly. Map it onto a fixed
++# allowlist instead and reject everything else.
++ALLOWED_ORDER_FIELDS = {'id', 'name'}
+ 
+ 
+ def vul(request):
+     query = request.GET.get('order', default='id')
+-    q = Collection.objects.order_by(query)
++    descending = query.startswith('-')
++    field = query[1:] if descending else query
++    if field not in ALLOWED_ORDER_FIELDS:
++        return HttpResponse('Invalid order parameter.', status=400)
++    q = Collection.objects.order_by(('-' if descending else '') + field)
+     return HttpResponse(q.values())
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,6 +1,9 @@
+ services:
+   web:
+     image: vulhub/django:3.2.4
++    # The published images are linux/amd64 only; pin the platform so the
++    # containers run through Rosetta emulation on Apple Silicon hosts.
++    platform: linux/amd64
+     working_dir: /app
+     volumes:
+       - .:/app
+@@ -11,6 +14,7 @@
+     command: bash /app/docker-entrypoint.sh
+   db:
+     image: mysql:5.7
++    platform: linux/amd64
+     environment:
+       - MYSQL_ROOT_PASSWORD=mysql
+       - MYSQL_DATABASE=cve

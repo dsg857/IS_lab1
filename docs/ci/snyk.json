@@ -1,0 +1,31 @@
+{
+  "dependencyCount": 23,
+  "displayTargetFile": "requirements-dev.txt",
+  "filesystemPolicy": false,
+  "filtered": {
+    "ignore": [],
+    "patch": []
+  },
+  "hasUnknownVersions": false,
+  "ignoreSettings": {
+    "adminOnly": false,
+    "autoApproveIgnores": false,
+    "disregardFilesystemIgnores": false,
+    "reasonRequired": false
+  },
+  "isPrivate": true,
+  "licensesPolicy": {
+    "orgLicenseRules": null,
+    "severities": null
+  },
+  "ok": true,
+  "org": "5aa92a90-e61f-4926-9182-2089d79e7a73",
+  "packageManager": "pip",
+  "path": "/home/runner/work/IS_lab1/IS_lab1",
+  "policy": "",
+  "projectName": "IS_lab1",
+  "summary": "No known vulnerabilities",
+  "targetFile": "",
+  "uniqueCount": 0,
+  "vulnerabilities": []
+}

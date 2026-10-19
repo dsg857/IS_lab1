@@ -1,0 +1,20 @@
+services:
+  web:
+    image: vulhub/django:3.2.4
+    # The published images are linux/amd64 only; pin the platform so the
+    # containers run through Rosetta emulation on Apple Silicon hosts.
+    platform: linux/amd64
+    working_dir: /app
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    command: bash /app/docker-entrypoint.sh
+  db:
+    image: mysql:5.7
+    platform: linux/amd64
+    environment:
+      - MYSQL_ROOT_PASSWORD=mysql
+      - MYSQL_DATABASE=cve
